@@ -1,0 +1,12 @@
+[Unit]
+Description=CEC to MQTT bridge for Home Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/cec-bridge/cec_bridge.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
