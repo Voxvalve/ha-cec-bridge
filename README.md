@@ -1,4 +1,4 @@
-# CEC Bridge for Home Assistant
+# CEC Bridge for Home Assistant/MQTT
 
 Switches any HDMI-CEC TV between inputs from Home Assistant, using a Raspberry
 Pi plugged into a spare HDMI port. No vendor API, no certificates, nothing
