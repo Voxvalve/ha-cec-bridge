@@ -14,7 +14,10 @@ set -euo pipefail
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=""; SSH_PORT=22; IDENTITY=""
 MQTT_HOST=""; MQTT_PORT=""; MQTT_USER=""; MQTT_PASS=""; BASE_TOPIC=""; DEVICE_NAME=""
-WEB_PORT=""; DETECT=0; UNINSTALL=0; ASSUME_YES=0; NO_KEY=0
+WEB_PORT=""; DETECT=0; UNINSTALL=0; ASSUME_YES=0; NO_KEY=0; UPDATE=0
+# Where the last target is remembered, so `./deploy.sh --update` needs no address.
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cec-bridge"
+STATE_FILE="$STATE_DIR/last-target"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; DIM=$'\e[2m'; BLD=$'\e[1m'; RST=$'\e[0m'
 [ -t 1 ] || { RED=""; GRN=""; YLW=""; DIM=""; BLD=""; RST=""; }
@@ -39,6 +42,8 @@ Options:
   --name NAME          Device name shown in Home Assistant
   --web-port PORT      Port for the settings page (default 8080)
   --detect-inputs      After installing, scan the HDMI bus and save what it finds
+  --update             Update the software only. Asks nothing, changes no
+                       settings, and reuses the last address if you omit it.
   --port PORT          SSH port (default 22)
   -i, --identity FILE  SSH private key
   --no-key-setup       Do not offer to install an SSH key
@@ -60,6 +65,7 @@ while [ $# -gt 0 ]; do
     --name) DEVICE_NAME="${2:-}"; shift 2 ;;
     --web-port) WEB_PORT="${2:-}"; shift 2 ;;
     --detect-inputs) DETECT=1; shift ;;
+    --update|--upgrade) UPDATE=1; shift ;;
     --port) SSH_PORT="${2:-}"; shift 2 ;;
     -i|--identity) IDENTITY="${2:-}"; shift 2 ;;
     --no-key-setup) NO_KEY=1; shift ;;
@@ -71,6 +77,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$UPDATE" -eq 1 ]; then
+  # The whole point of --update is that it cannot touch your configuration,
+  # so a flag that would change settings is a contradiction, not a preference.
+  CONFLICT=""
+  [ -n "$MQTT_HOST" ]   && CONFLICT="$CONFLICT --mqtt-host"
+  [ -n "$MQTT_PORT" ]   && CONFLICT="$CONFLICT --mqtt-port"
+  [ -n "$MQTT_USER" ]   && CONFLICT="$CONFLICT --mqtt-user"
+  [ -n "$MQTT_PASS" ]   && CONFLICT="$CONFLICT --mqtt-pass"
+  [ -n "$BASE_TOPIC" ]  && CONFLICT="$CONFLICT --base-topic"
+  [ -n "$DEVICE_NAME" ] && CONFLICT="$CONFLICT --name"
+  [ -n "$WEB_PORT" ]    && CONFLICT="$CONFLICT --web-port"
+  [ -n "$CONFLICT" ] && die "--update never changes settings, so it cannot be combined with:$CONFLICT
+       Drop --update to change them, or drop those flags to update the software only."
+  [ "$UNINSTALL" -eq 1 ] && die "--update and --uninstall do opposite things."
+  ASSUME_YES=1; NO_KEY=1          # an update asks nothing
+fi
+
 command -v ssh >/dev/null || die "ssh is not installed."
 command -v scp >/dev/null || die "scp is not installed."
 for f in cec_bridge.py install.sh cec-bridge.service; do
@@ -78,7 +101,30 @@ for f in cec_bridge.py install.sh cec-bridge.service; do
 done
 
 # ---------------------------------------------------------------- the target
+if [ -z "$TARGET" ] && [ -f "$STATE_FILE" ]; then
+  # Reuse the Pi from last time: always for --update, and as the suggested
+  # default otherwise.
+  LAST_TARGET=""; LAST_PORT=""; LAST_IDENTITY=""
+  # shellcheck disable=SC1090
+  . "$STATE_FILE" 2>/dev/null || true
+  if [ -n "$LAST_TARGET" ]; then
+    if [ "$UPDATE" -eq 1 ]; then
+      TARGET="$LAST_TARGET"
+      [ "$SSH_PORT" = 22 ] && [ -n "$LAST_PORT" ] && SSH_PORT="$LAST_PORT"
+      [ -z "$IDENTITY" ] && [ -n "$LAST_IDENTITY" ] && IDENTITY="$LAST_IDENTITY"
+      say "Updating ${BLD}$TARGET${RST} (remembered from last time)"
+    elif [ -t 0 ]; then
+      printf 'Raspberry Pi to install on %s[Enter for %s]%s: ' "$DIM" "$LAST_TARGET" "$RST"
+      read -r TARGET
+      [ -n "$TARGET" ] || { TARGET="$LAST_TARGET"
+        [ "$SSH_PORT" = 22 ] && [ -n "$LAST_PORT" ] && SSH_PORT="$LAST_PORT"
+        [ -z "$IDENTITY" ] && [ -n "$LAST_IDENTITY" ] && IDENTITY="$LAST_IDENTITY"; }
+    fi
+  fi
+fi
 if [ -z "$TARGET" ]; then
+  [ "$UPDATE" -eq 1 ] && die "No Pi remembered yet, so --update has nothing to update.
+       Give the address once:  ./deploy.sh cec@192.168.1.11 --update"
   printf 'Raspberry Pi to install on, as user@address %s[e.g. pi@192.168.1.11]%s: ' "$DIM" "$RST"
   read -r TARGET
   [ -n "$TARGET" ] || die "No target given."
@@ -168,9 +214,19 @@ ok "$(get os) ($(get arch))"
 if [ -n "$(get cec)" ]; then ok "CEC device: $(get cec)"
 else warn "no /dev/cec* yet. If this is a Pi, check that vc4-kms-v3d is enabled in
     /boot/firmware/config.txt and reboot. Installing anyway."; fi
-[ "$(get existing)" = "yes" ] && say "An existing install was found; it will be updated (settings kept)."
+if [ "$(get existing)" = "yes" ]; then
+  say "An existing install was found; it will be updated (settings kept)."
+elif [ "$UPDATE" -eq 1 ]; then
+  die "There is no CEC bridge on $PI_HOST to update.
+       Install it first:  ./deploy.sh $TARGET"
+fi
 
 PI_IP="$(get ip)"; [ -n "$PI_IP" ] || PI_IP="$PI_HOST"
+
+# Fingerprint the settings before touching anything, so the end of an update
+# can prove they came through unchanged.
+CFG_BEFORE=""
+[ "$UPDATE" -eq 1 ] && CFG_BEFORE="$(sh_ 'sudo md5sum /opt/cec-bridge/config.json 2>/dev/null | cut -d" " -f1' || true)"
 
 if [ "$ASSUME_YES" -eq 0 ]; then
   printf '\nInstall the CEC bridge on %s%s%s? [Y/n] ' "$BLD" "$PI_HOST" "$RST"
@@ -178,7 +234,7 @@ if [ "$ASSUME_YES" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------- MQTT config
-if [ -z "$MQTT_HOST" ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+if [ -z "$MQTT_HOST" ] && [ "$UPDATE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
   printf '\nConfigure MQTT now? Leave blank to do it later in the browser.\n'
   printf '  Home Assistant address: '; read -r MQTT_HOST
   if [ -n "$MQTT_HOST" ]; then
@@ -329,22 +385,59 @@ PYEOF
   esac
 fi
 
+if [ "$UPDATE" -eq 1 ]; then
+  CFG_AFTER="$(sh_ 'sudo md5sum /opt/cec-bridge/config.json 2>/dev/null | cut -d" " -f1' || true)"
+  if [ -n "$CFG_BEFORE" ] && [ "$CFG_BEFORE" = "$CFG_AFTER" ]; then
+    shdata_ "cat > '$STAGE/summary.py'" <<'PYEOF'
+import json
+with open('/opt/cec-bridge/config.json') as f:
+    c = json.load(f)
+bits = [f"{len(c.get('inputs', []))} input(s)"]
+if c.get('key_buttons'):
+    bits.append(f"{len(c['key_buttons'])} key button(s)")
+bits.append(f"MQTT {c.get('mqtt_host', '?')}:{c.get('mqtt_port', '?')}")
+print(", ".join(bits))
+PYEOF
+    SUMMARY="$(sh_ "sudo python3 '$STAGE/summary.py'" 2>/dev/null || true)"
+    ok "settings untouched${SUMMARY:+ — $SUMMARY}"
+  elif [ -n "$CFG_BEFORE" ]; then
+    warn "the settings file changed during the update, which it should not have."
+  fi
+fi
+
+# Remember this Pi so a later `./deploy.sh --update` needs no address.
+mkdir -p "$STATE_DIR" 2>/dev/null && {
+  printf 'LAST_TARGET=%s\nLAST_PORT=%s\nLAST_IDENTITY=%s\n' \
+    "$TARGET" "$SSH_PORT" "$IDENTITY" > "$STATE_FILE"
+} 2>/dev/null || true
+
 sh_ 'rm -rf /tmp/cec-bridge.*' 2>/dev/null || true
 
-cat <<EOF
+if [ "$UPDATE" -eq 1 ]; then
+  cat <<EOF
+
+${GRN}${BLD}Updated.${RST}  Your configuration was left alone.
+
+  Settings page   ${BLD}$URL${RST}
+  Logs            ssh $TARGET 'journalctl -u cec-bridge -f'
+EOF
+else
+  cat <<EOF
 
 ${GRN}${BLD}Done.${RST}
 
   Settings page   ${BLD}$URL${RST}
   Logs            ssh $TARGET 'journalctl -u cec-bridge -f'
   Restart         ssh $TARGET 'sudo systemctl restart cec-bridge'
+  Update later    ./deploy.sh --update
   Remove          ./deploy.sh $TARGET --uninstall
 
 Open the settings page to add your inputs and pick the remote keys you want
 in Home Assistant.
 EOF
+fi
 
-if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && command -v xdg-open >/dev/null 2>&1; then
+if [ "$UPDATE" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && command -v xdg-open >/dev/null 2>&1; then
   printf '\nOpen the settings page now? [Y/n] '
   read -r a; case "$a" in [Nn]*) ;; *) xdg-open "$URL" >/dev/null 2>&1 & ;; esac
 fi
